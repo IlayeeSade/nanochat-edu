@@ -29,6 +29,11 @@ SPECIAL_TOKENS = [
 # I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
+###
+# this splits text between punctuation marks, numbers, spaces and more. The
+# chunks it splits to, let's the BPE encoding work on it.
+###
+
 # -----------------------------------------------------------------------------
 # Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
 from tokenizers import Tokenizer as HFTokenizer
@@ -61,6 +66,11 @@ class HuggingFaceTokenizer:
         # Configure the HuggingFace Tokenizer
         tokenizer = HFTokenizer(BPE(
             byte_fallback=True, # needed!
+            ###
+            # byte_fallback replaces text without a map to token from <unk> to its
+            # byte representation. For example, an Emoji :) might be a sequence of
+            # [123, 192, 302, ...]
+            ### 
             unk_token=None,
             fuse_unk=False,
         ))
@@ -73,19 +83,19 @@ class HuggingFaceTokenizer:
         # (but I haven't validated this! TODO)
         gpt4_split_regex = Regex(SPLIT_PATTERN) # huggingface demands that you wrap it in Regex!!
         tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
-            pre_tokenizers.Split(pattern=gpt4_split_regex, behavior="isolated", invert=False),
-            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+            pre_tokenizers.Split(pattern=gpt4_split_regex, behavior="isolated", invert=False), # splits to chunks to BPE inside
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False) # converts the text to bytes, 'u' -> [89, ...]
         ])
         # Decoder: ByteLevel (it pairs together with the ByteLevel pre-tokenizer)
-        tokenizer.decoder = decoders.ByteLevel()
+        tokenizer.decoder = decoders.ByteLevel() # decodes from the byteLevel, it was text -> bytes, now bytes -> text
         # Post-processor: None
         tokenizer.post_processor = None
         # Trainer: BPE
         trainer = BpeTrainer(
             vocab_size=vocab_size,
             show_progress=True,
-            min_frequency=0, # no minimum frequency
-            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            min_frequency=0, # no minimum frequency  # makes it merge until there is nothing to merge.
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(), # makes sure the alphabet has tokens, in order to not have missing shit
             special_tokens=SPECIAL_TOKENS,
         )
         # Kick off the training
@@ -128,7 +138,7 @@ class HuggingFaceTokenizer:
         bos = self.encode_special("<|bos|>")
         # 2) if that fails, attempt to find a <|endoftext|> token (e.g. GPT-2 models)
         if bos is None:
-            bos = self.encode_special("<|endoftext|>")
+            bos = self.encode_special("<|endoftext|>") # sometimes EOT is used for both EOT and BOS I think ?
         # 3) if these fail, it's better to crash than to silently return None
         assert bos is not None, "Failed to find BOS token in tokenizer"
         return bos
@@ -174,14 +184,14 @@ class RustBPETokenizer:
         # the special tokens are inserted later in __init__, we don't train them here
         vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
         assert vocab_size_no_special >= 256, f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
-        tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
+        tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN) # real training
         # 2) construct the associated tiktoken encoding for inference
         pattern = tokenizer.get_pattern()
-        mergeable_ranks_list = tokenizer.get_mergeable_ranks()
-        mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
+        mergeable_ranks_list = tokenizer.get_mergeable_ranks() # I think it returns a dict of all the merges with ranks such that lower rank == higher freq
+        mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list} # converts the merge to raw bytes
         tokens_offset = len(mergeable_ranks)
         special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-        enc = tiktoken.Encoding(
+        enc = tiktoken.Encoding( # Creates the tiktoken inference encoder given the training data.
             name="rustbpe",
             pat_str=pattern,
             mergeable_ranks=mergeable_ranks, # dict[bytes, int] (token bytes -> merge priority rank)
