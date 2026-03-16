@@ -225,7 +225,7 @@ class RustBPETokenizer:
     def id_to_token(self, id):
         return self.enc.decode([id])
 
-    @lru_cache(maxsize=32)
+    @lru_cache(maxsize=32) # last recently used caching instead of really running the function.
     def encode_special(self, text):
         return self.enc.encode_single_token(text)
 
