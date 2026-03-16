@@ -51,7 +51,11 @@ class Linear(nn.Linear):
 
 
 def has_ve(layer_idx, n_layer):
-    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
+    """
+    Returns True if GPT layer should have Value Embedding (alternating, last layer always included).
+    Value-Embedding is usually insert the original embedding of the tokens into W_v in attn
+    This is done to preserve information and similar spirit to res connections.
+    """
     return layer_idx % 2 == (n_layer - 1) % 2
 
 def apply_rotary_emb(x, cos, sin):
@@ -98,6 +102,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
+        # Why splitting? (Ilayee)
+        # I think gradients may be the reason, we want gradients to be uniform between both of them
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
