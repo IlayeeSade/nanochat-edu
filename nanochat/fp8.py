@@ -67,6 +67,10 @@ compared to the matmul. In practice this means our version is slightly faster
 (less compilation overhead, no tensor subclass dispatch cost) but can produce
 subtly different floating-point rounding paths under torch.compile, since Inductor
 generates a different graph. Numerics are bitwise identical in eager mode.
+
+On-the-fly quantization, neglectable for GEMMs, still works with regular training
+I think because all outputs are in higher-precision. Then gradients, AdamW and generally
+optimizers can work.
 """
 
 import torch
