@@ -7,6 +7,15 @@ Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+# AdamW - keeps momentum (first term grad) for each weight param
+# and it keeps variance (second term grad) for each weight for normalization given 
+# "high" momentum.
+# Muon - Normalizes the grad matrix for weight Nabla(W) , orthonormalizes.
+# Imagine SVD decomp, then removing sigma in order to normalize the directions.
+# Those are direction in the parameter space because they are outer product
+# u_i @ v_i^T
+# It also uses momentum but not variance.
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
@@ -17,6 +26,9 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
+# torch compile may fused it because everything here is element-wise
+# and fullgraph will make it use CUDA graph if possible
+# dynamic is saying the shapes are fixed (required for CUDA graph)
 @torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
@@ -38,7 +50,7 @@ def adamw_step_fused(
     # Weight decay (decoupled, applied before the update)
     p.mul_(1 - lr_t * wd_t)
     # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg.lerp_(grad, 1 - beta1_t)
+    exp_avg.lerp_(grad, 1 - beta1_t) # just the formula in a func.
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
     # Bias corrections
     bias1 = 1 - beta1_t ** step_t
@@ -109,6 +121,7 @@ def muon_step_fused(
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    
     g = stacked_grads.lerp_(momentum_buffer, momentum)
 
     # Polar express
@@ -127,16 +140,24 @@ def muon_step_fused(
     g = X
 
     # Variance reduction
+    # we calculate for each weight matrix is \sim frobenius norm
+    # seemingly weird way to calculate it, I guess it improves performance
+    # or keeps from overflowing maybe or precision
     beta2 = beta2_t.to(g.dtype)
     v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
+    
     second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    # using the step_size to make rows/columns with larger historical values downscale more
+    
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
     final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    # After we use this downscaling we change the F-norm of the matrix, so we divide by the scaling 
+    # Then keep the same norm we the orthogonlized matrix started with
     g = g * final_scale.to(g.dtype)
 
     # Cautious weight decay + parameter update
@@ -303,6 +324,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     Design Goals:
     - Overlap communication with computation (async ops)
+        To my understanding, the overlapping is between param_groups. When group 1 needs comms [reduce-scatter],
+        Group 0 might have already finished its comms and can compute. And alternatively 
+        When group 0 needs comms [all-gather], group 1 might need compute.
     - Minimize memory by sharding optimizer states across ranks (ZeRO-2 style)
     - Batch small tensors into single comm ops where possible
 
@@ -320,6 +344,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
         Phase 3: Wait for gathers, copy back
             - Wait for all gathers to complete
             - Copy updated params back to original tensors (Muon only)
+
+    AdamW is only for those who are not using Muon, While Muon is optimizing all matrix-like
+    Tensors which have the same shape in the same rank.
 
     AdamW Communication (ZeRO-2 style):
     - Small params (<1024 elements): all_reduce gradients, update full param on each rank.
@@ -351,7 +378,11 @@ class DistMuonAdamW(torch.optim.Optimizer):
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+
+    General info:
+        All of these operation add_(), sub_(), zero_() act in-place
     """
+    
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
@@ -367,6 +398,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
+        # Every rank has a shareded optimizer states, now it is reducing.
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
         param_infos = {}
         for p in group['params']:
@@ -379,7 +411,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 # Large params: reduce_scatter
                 assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
+                # Generates a place to store the gradient update
+                # for the part we account for in this rank
                 grad_slice = torch.empty_like(grad[:rank_size])
+                # modifies grad the AVG inplace and then scatter, launches Async
                 future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
         return dict(param_infos=param_infos)
@@ -387,7 +422,7 @@ class DistMuonAdamW(torch.optim.Optimizer):
     def _reduce_muon(self, group: dict, world_size: int) -> dict:
         """Launch async reduce op for Muon group. Returns info dict."""
         params = group['params']
-        chunk_size = (len(params) + world_size - 1) // world_size
+        chunk_size = (len(params) + world_size - 1) // world_size # cdiv for padding params (W matrices)
         padded_num_params = chunk_size * world_size
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
@@ -399,7 +434,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
         if len(params) < padded_num_params:
             stacked_grads[len(params):].zero_()
 
-        # Reduce_scatter to get this rank's chunk
+        # Reduce_scatter to get this rank's chunk similarly to before but now it
+        # is acroos params (W_0, W_1, ...) and not across the first dim in any param considered for AdamW.
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
 
